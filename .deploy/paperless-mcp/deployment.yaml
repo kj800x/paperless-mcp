@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: paperless-mcp
+  name: paperless-mcp
+  namespace: kj800x
+spec:
+  replicas: 1
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      app: paperless-mcp
+  template:
+    metadata:
+      labels:
+        app: paperless-mcp
+    spec:
+      containers:
+        - name: paperless-mcp
+          image: ghcr.io/kj800x/paperless-mcp:commit-$SHA
+          command: [paperless-mcp]
+          env:
+            - name: PAPERLESS_URL
+              value: http://webserver.paperless.svc.cluster.local:8000
+            - name: PAPERLESS_PUBLIC_URL
+              value: https://paperless.home.coolkev.com
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 15
+      imagePullSecrets:
+        - name: ghcr-kj800x

@@ -1,0 +1,8 @@
+artifactRepo:
+  owner: kj800x
+  repo: paperless-mcp
+  branch: master
+
+team: kj800x
+kind: service
+namespace: kj800x

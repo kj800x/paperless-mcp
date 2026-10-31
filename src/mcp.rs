@@ -96,7 +96,7 @@ pub async fn handle_mcp(
                         }),
                     )
                 }
-                Err(PaperlessError::Unauthorized) => {
+                Err(PaperlessError::Unauthorized | PaperlessError::Forbidden) => {
                     return unauthorized("Paperless rejected the API token.");
                 }
                 Err(e) => error(request.id, -32603, &e.to_string()),

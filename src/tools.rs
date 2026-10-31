@@ -2,10 +2,12 @@ use serde_json::{Value, json};
 
 use crate::paperless::{NamedObject, Page, Paperless, PaperlessError, truncate};
 
-pub const SERVER_INSTRUCTIONS: &str = "Read-only access to a Paperless-ngx document archive \
+pub const SERVER_INSTRUCTIONS: &str = "Access to a Paperless-ngx document archive \
 (scanned mail, receipts, statements, tax forms, manuals, etc.). Start with search_documents; \
 use list_tags / list_correspondents / list_document_types to discover filter values. \
-get_document returns OCR text, which may be imperfect.";
+get_document returns OCR text, which may be imperfect. update_document changes a document's \
+title, date, correspondent, type and tags (existing values only); add_note attaches a note. \
+Nothing can be deleted or uploaded.";
 
 const DEFAULT_PAGE_SIZE: i64 = 10;
 const MAX_PAGE_SIZE: i64 = 50;
@@ -19,6 +21,8 @@ const TOOL_NAMES: &[&str] = &[
     "list_tags",
     "list_correspondents",
     "list_document_types",
+    "update_document",
+    "add_note",
 ];
 
 pub fn is_known(name: &str) -> bool {
@@ -26,6 +30,71 @@ pub fn is_known(name: &str) -> bool {
 }
 
 pub fn tool_definitions() -> Value {
+    let mut tools = read_tool_definitions();
+    let read_only = json!({ "readOnlyHint": true, "openWorldHint": false });
+    for tool in tools.as_array_mut().into_iter().flatten() {
+        tool["annotations"] = read_only.clone();
+    }
+    let write = json!({
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+    });
+    for mut tool in write_tool_definitions() {
+        tool["annotations"] = write.clone();
+        tools.as_array_mut().unwrap().push(tool);
+    }
+    tools
+}
+
+fn write_tool_definitions() -> Vec<Value> {
+    let name_or_id = "Name (case-insensitive) or numeric id; must already exist";
+    vec![
+        json!({
+            "name": "update_document",
+            "description": "Change a document's metadata. Only the fields you pass are changed. \
+                Tags, correspondents and document types must already exist (see list_tags etc.); \
+                nothing is created. Returns the updated document summary.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer" },
+                    "title": { "type": "string" },
+                    "created": { "type": "string", "description": "Document date, YYYY-MM-DD" },
+                    "correspondent": { "type": "string", "description": name_or_id },
+                    "document_type": { "type": "string", "description": name_or_id },
+                    "add_tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": format!("Tags to add. {}", name_or_id)
+                    },
+                    "remove_tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": format!("Tags to remove. {}", name_or_id)
+                    }
+                },
+                "required": ["id"]
+            }
+        }),
+        json!({
+            "name": "add_note",
+            "description": "Add a note to a document. Notes are visible in Paperless and \
+                included in full-text search.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer" },
+                    "note": { "type": "string" }
+                },
+                "required": ["id", "note"]
+            }
+        }),
+    ]
+}
+
+fn read_tool_definitions() -> Value {
     let name_or_id = "Name (case-insensitive) or numeric id";
     json!([
         {
@@ -133,6 +202,8 @@ pub async fn dispatch(
         "list_document_types" => {
             list_named(auth, paperless, "document types", |l| &l.document_types).await
         }
+        "update_document" => update_document(args, auth, paperless).await,
+        "add_note" => add_note(args, auth, paperless).await,
         _ => return Err(format!("Unknown tool: {}", name)),
     };
     result.map_err(|e| match e {
@@ -232,6 +303,30 @@ fn resolve(objects: &[NamedObject], kind: &str, value: &str) -> Result<i64, Tool
     )))
 }
 
+fn arg_tag_ids(
+    args: &Value,
+    key: &str,
+    lookups: &crate::paperless::Lookups,
+) -> Result<Vec<i64>, ToolError> {
+    let names: Vec<String> = match args.get(key) {
+        None | Some(Value::Null) => vec![],
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.trim().to_string(),
+                other => other.to_string(),
+            })
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(Value::String(s)) => vec![s.trim().to_string()],
+        Some(_) => return Err(ToolError::Invalid(format!("`{}` must be an array", key))),
+    };
+    names
+        .iter()
+        .map(|t| resolve(&lookups.tags, "tags", t))
+        .collect()
+}
+
 fn page_size(args: &Value) -> Result<i64, ToolError> {
     Ok(arg_int(args, "page_size")?
         .unwrap_or(DEFAULT_PAGE_SIZE)
@@ -258,24 +353,9 @@ async fn search_documents(
         query.push(("query", q.to_string()));
     }
 
-    let tags: Vec<String> = match args.get("tags") {
-        None | Some(Value::Null) => vec![],
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|v| match v {
-                Value::String(s) => s.trim().to_string(),
-                other => other.to_string(),
-            })
-            .filter(|s| !s.is_empty())
-            .collect(),
-        Some(Value::String(s)) => vec![s.trim().to_string()],
-        Some(_) => return Err(ToolError::Invalid("`tags` must be an array".to_string())),
-    };
+    let tags = arg_tag_ids(args, "tags", &lookups)?;
     if !tags.is_empty() {
-        let ids = tags
-            .iter()
-            .map(|t| resolve(&lookups.tags, "tags", t).map(|id| id.to_string()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let ids: Vec<String> = tags.iter().map(i64::to_string).collect();
         query.push(("tags__id__all", ids.join(",")));
     }
     if let Some(c) = arg_str(args, "correspondent") {
@@ -548,6 +628,131 @@ async fn get_document(
     }
 
     Ok(out)
+}
+
+async fn update_document(
+    args: &Value,
+    auth: &str,
+    paperless: &Paperless,
+) -> Result<String, ToolError> {
+    let id = arg_int(args, "id")?.ok_or_else(|| ToolError::Invalid("`id` is required".into()))?;
+    let lookups = paperless.lookups(auth).await?;
+
+    // Validate everything before touching Paperless.
+    let mut patch = serde_json::Map::new();
+    let mut changes = vec![];
+    if let Some(title) = arg_str(args, "title") {
+        patch.insert("title".into(), json!(title));
+        changes.push(format!("title → {}", title));
+    }
+    if let Some(created) = arg_date(args, "created")? {
+        patch.insert("created".into(), json!(created));
+        changes.push(format!("date → {}", created));
+    }
+    if let Some(c) = arg_str(args, "correspondent") {
+        let cid = resolve(&lookups.correspondents, "correspondents", c)?;
+        patch.insert("correspondent".into(), json!(cid));
+        changes.push(format!(
+            "correspondent → {}",
+            lookups.correspondent_name(cid)
+        ));
+    }
+    if let Some(t) = arg_str(args, "document_type") {
+        let tid = resolve(&lookups.document_types, "document types", t)?;
+        patch.insert("document_type".into(), json!(tid));
+        changes.push(format!("type → {}", lookups.document_type_name(tid)));
+    }
+    let add = arg_tag_ids(args, "add_tags", &lookups)?;
+    let remove = arg_tag_ids(args, "remove_tags", &lookups)?;
+    if let Some(both) = add.iter().find(|t| remove.contains(t)) {
+        return Err(ToolError::Invalid(format!(
+            "Tag \"{}\" is in both add_tags and remove_tags",
+            lookups.tag_name(*both)
+        )));
+    }
+
+    if !add.is_empty() || !remove.is_empty() {
+        // Paperless replaces the whole tag list, so merge with the current one.
+        let doc = paperless.document(auth, id).await?;
+        let current: Vec<i64> = doc
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|t| t.iter().filter_map(|t| t.as_i64()).collect())
+            .unwrap_or_default();
+        let mut tags: Vec<i64> = current
+            .iter()
+            .copied()
+            .filter(|t| !remove.contains(t))
+            .collect();
+        for t in &add {
+            if !tags.contains(t) {
+                tags.push(*t);
+            }
+        }
+        for t in add.iter().filter(|t| !current.contains(t)) {
+            changes.push(format!("+tag {}", lookups.tag_name(*t)));
+        }
+        for t in remove.iter().filter(|t| current.contains(t)) {
+            changes.push(format!("-tag {}", lookups.tag_name(*t)));
+        }
+        if tags != current {
+            patch.insert("tags".into(), json!(tags));
+        }
+    }
+
+    if patch.is_empty() {
+        return if changes.is_empty() && add.is_empty() && remove.is_empty() {
+            Err(ToolError::Invalid(
+                "Nothing to change: pass at least one of title, created, correspondent, \
+                 document_type, add_tags, remove_tags"
+                    .into(),
+            ))
+        } else {
+            Ok(format!(
+                "Document #{} already has those tags; nothing changed.",
+                id
+            ))
+        };
+    }
+
+    let updated: Value = paperless
+        .patch(
+            auth,
+            &format!("/api/documents/{}/", id),
+            &Value::Object(patch),
+        )
+        .await?;
+    log::info!(
+        "Updated document {} for {}: {}",
+        id,
+        lookups.username,
+        changes.join(", ")
+    );
+    Ok(format!(
+        "Updated ({}):\n{}\n  url: {}\n",
+        changes.join(", "),
+        summary_line(&updated, &lookups),
+        paperless.document_url(id)
+    ))
+}
+
+async fn add_note(args: &Value, auth: &str, paperless: &Paperless) -> Result<String, ToolError> {
+    let id = arg_int(args, "id")?.ok_or_else(|| ToolError::Invalid("`id` is required".into()))?;
+    let note =
+        arg_str(args, "note").ok_or_else(|| ToolError::Invalid("`note` is required".into()))?;
+    let _: Value = paperless
+        .post(
+            auth,
+            &format!("/api/documents/{}/notes/", id),
+            &json!({ "note": note }),
+        )
+        .await?;
+    log::info!("Added note to document {}", id);
+    Ok(format!(
+        "Added note to document #{}.\n  url: {}\n",
+        id,
+        paperless.document_url(id)
+    ))
 }
 
 async fn list_named(

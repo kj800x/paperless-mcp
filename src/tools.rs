@@ -6,7 +6,8 @@ pub const SERVER_INSTRUCTIONS: &str = "Access to a Paperless-ngx document archiv
 (scanned mail, receipts, statements, tax forms, manuals, etc.). Start with search_documents; \
 use list_tags / list_correspondents / list_document_types to discover filter values. \
 get_document returns OCR text, which may be imperfect. update_document changes a document's \
-title, date, correspondent, type and tags (existing values only); add_note attaches a note. \
+title, date, correspondent, type and tags (existing values only); create_tag / \
+create_correspondent add new ones first if needed; add_note attaches a note. \
 Nothing can be deleted or uploaded.";
 
 const DEFAULT_PAGE_SIZE: i64 = 10;
@@ -23,7 +24,13 @@ const TOOL_NAMES: &[&str] = &[
     "list_document_types",
     "update_document",
     "add_note",
+    "create_tag",
+    "create_correspondent",
 ];
+
+/// Paperless's "Auto" matching: the classifier learns from documents the object
+/// is assigned to. Same default the Paperless UI uses for new objects.
+const MATCHING_AUTO: i64 = 6;
 
 pub fn is_known(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
@@ -89,6 +96,35 @@ fn write_tool_definitions() -> Vec<Value> {
                     "note": { "type": "string" }
                 },
                 "required": ["id", "note"]
+            }
+        }),
+        json!({
+            "name": "create_tag",
+            "description": "Create a new tag. Check list_tags first; if a tag with the same name \
+                (case-insensitive) already exists, it is returned instead of creating a duplicate. \
+                Uses Paperless's Auto matching. Returns the tag's id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "color": { "type": "string", "description": "Hex color, e.g. #a6cee3. Default: Paperless picks one" },
+                    "is_inbox_tag": { "type": "boolean", "description": "Auto-apply to newly consumed documents. Default false" }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "create_correspondent",
+            "description": "Create a new correspondent (sender/organization). Check \
+                list_correspondents first; if one with the same name (case-insensitive) already \
+                exists, it is returned instead of creating a duplicate. Uses Paperless's Auto \
+                matching. Returns the correspondent's id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" }
+                },
+                "required": ["name"]
             }
         }),
     ]
@@ -204,6 +240,8 @@ pub async fn dispatch(
         }
         "update_document" => update_document(args, auth, paperless).await,
         "add_note" => add_note(args, auth, paperless).await,
+        "create_tag" => create_tag(args, auth, paperless).await,
+        "create_correspondent" => create_correspondent(args, auth, paperless).await,
         _ => return Err(format!("Unknown tool: {}", name)),
     };
     result.map_err(|e| match e {
@@ -755,6 +793,117 @@ async fn add_note(args: &Value, auth: &str, paperless: &Paperless) -> Result<Str
     ))
 }
 
+fn arg_color(args: &Value, key: &str) -> Result<Option<String>, ToolError> {
+    let Some(value) = arg_str(args, key) else {
+        return Ok(None);
+    };
+    let hex = value.strip_prefix('#').unwrap_or(value);
+    if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(Some(format!("#{}", hex.to_lowercase())))
+    } else {
+        Err(ToolError::Invalid(format!(
+            "`{}` must be a hex color like #a6cee3",
+            key
+        )))
+    }
+}
+
+fn arg_bool(args: &Value, key: &str) -> Result<Option<bool>, ToolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            _ => Err(ToolError::Invalid(format!("`{}` must be a boolean", key))),
+        },
+        Some(_) => Err(ToolError::Invalid(format!("`{}` must be a boolean", key))),
+    }
+}
+
+async fn create_tag(args: &Value, auth: &str, paperless: &Paperless) -> Result<String, ToolError> {
+    let name =
+        arg_str(args, "name").ok_or_else(|| ToolError::Invalid("`name` is required".into()))?;
+    let color = arg_color(args, "color")?;
+    let is_inbox = arg_bool(args, "is_inbox_tag")?;
+
+    let mut body = json!({ "name": name, "matching_algorithm": MATCHING_AUTO });
+    if let Some(c) = &color {
+        body["color"] = json!(c);
+    }
+    if let Some(i) = is_inbox {
+        body["is_inbox_tag"] = json!(i);
+    }
+    create_named(
+        auth,
+        paperless,
+        "tag",
+        "/api/tags/",
+        |l| &l.tags,
+        name,
+        body,
+    )
+    .await
+}
+
+async fn create_correspondent(
+    args: &Value,
+    auth: &str,
+    paperless: &Paperless,
+) -> Result<String, ToolError> {
+    let name =
+        arg_str(args, "name").ok_or_else(|| ToolError::Invalid("`name` is required".into()))?;
+    let body = json!({ "name": name, "matching_algorithm": MATCHING_AUTO });
+    create_named(
+        auth,
+        paperless,
+        "correspondent",
+        "/api/correspondents/",
+        |l| &l.correspondents,
+        name,
+        body,
+    )
+    .await
+}
+
+/// Creates a tag/correspondent unless one with that name already exists.
+async fn create_named(
+    auth: &str,
+    paperless: &Paperless,
+    kind: &str,
+    path: &str,
+    select: impl Fn(&crate::paperless::Lookups) -> &Vec<NamedObject>,
+    name: &str,
+    body: Value,
+) -> Result<String, ToolError> {
+    // Bypass the cache so a recent creation (from any client) is seen.
+    paperless.invalidate_lookups(auth);
+    let lookups = paperless.lookups(auth).await?;
+    if let Some(existing) = select(&lookups)
+        .iter()
+        .find(|o| o.name.eq_ignore_ascii_case(name))
+    {
+        return Ok(format!(
+            "A {} named \"{}\" already exists (id {}); nothing created.",
+            kind, existing.name, existing.id
+        ));
+    }
+
+    let created: NamedObject = paperless.post(auth, path, &body).await?;
+    paperless.invalidate_lookups(auth);
+    log::info!(
+        "Created {} \"{}\" (id {}) for {}",
+        kind,
+        created.name,
+        created.id,
+        lookups.username
+    );
+    Ok(format!(
+        "Created {} \"{}\" (id {}).",
+        kind, created.name, created.id
+    ))
+}
+
 async fn list_named(
     auth: &str,
     paperless: &Paperless,
@@ -850,5 +999,19 @@ mod tests {
                 .is_some()
         );
         assert!(arg_date(&json!({"d": "2024/01/31"}), "d").is_err());
+    }
+
+    #[test]
+    fn color_validation() {
+        assert_eq!(
+            arg_color(&json!({"c": "A6CEE3"}), "c").unwrap().as_deref(),
+            Some("#a6cee3")
+        );
+        assert_eq!(
+            arg_color(&json!({"c": "#a6cee3"}), "c").unwrap().as_deref(),
+            Some("#a6cee3")
+        );
+        assert!(arg_color(&json!({"c": "red"}), "c").is_err());
+        assert!(arg_color(&json!({}), "c").unwrap().is_none());
     }
 }

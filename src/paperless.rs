@@ -232,6 +232,11 @@ impl Paperless {
         Ok(lookups)
     }
 
+    /// Drops this token's cached lookups so newly created objects resolve immediately.
+    pub fn invalidate_lookups(&self, auth: &str) {
+        self.lookup_cache.lock().unwrap().remove(auth);
+    }
+
     pub fn document_url(&self, id: i64) -> String {
         format!("{}/documents/{}/details", self.public_url, id)
     }

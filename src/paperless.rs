@@ -11,6 +11,7 @@ const LOOKUP_TTL: Duration = Duration::from_secs(300);
 #[derive(Debug)]
 pub enum PaperlessError {
     Unauthorized,
+    Forbidden,
     NotFound,
     Other(String),
 }
@@ -19,8 +20,12 @@ impl std::fmt::Display for PaperlessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PaperlessError::Unauthorized => {
-                write!(f, "Paperless rejected the API token (401/403)")
+                write!(f, "Paperless rejected the API token (401)")
             }
+            PaperlessError::Forbidden => write!(
+                f,
+                "Paperless denied the request (403): this user lacks permission for that action"
+            ),
             PaperlessError::NotFound => write!(f, "Not found"),
             PaperlessError::Other(msg) => write!(f, "{}", msg),
         }
@@ -126,12 +131,37 @@ impl Paperless {
         query: &[(&str, String)],
     ) -> Result<T, PaperlessError> {
         let url = format!("{}{}", self.base_url, path);
-        let response = self
-            .http
-            .get(&url)
+        self.send(self.http.get(&url).query(query), auth).await
+    }
+
+    pub async fn patch<T: DeserializeOwned>(
+        &self,
+        auth: &str,
+        path: &str,
+        body: &Value,
+    ) -> Result<T, PaperlessError> {
+        let url = format!("{}{}", self.base_url, path);
+        self.send(self.http.patch(&url).json(body), auth).await
+    }
+
+    pub async fn post<T: DeserializeOwned>(
+        &self,
+        auth: &str,
+        path: &str,
+        body: &Value,
+    ) -> Result<T, PaperlessError> {
+        let url = format!("{}{}", self.base_url, path);
+        self.send(self.http.post(&url).json(body), auth).await
+    }
+
+    async fn send<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        auth: &str,
+    ) -> Result<T, PaperlessError> {
+        let response = request
             .header("Authorization", auth)
             .header("Accept", API_ACCEPT)
-            .query(query)
             .send()
             .await
             .map_err(|e| PaperlessError::Other(format!("Request to Paperless failed: {}", e)))?;
@@ -140,7 +170,8 @@ impl Paperless {
             200..=299 => response.json::<T>().await.map_err(|e| {
                 PaperlessError::Other(format!("Unexpected response from Paperless: {}", e))
             }),
-            401 | 403 => Err(PaperlessError::Unauthorized),
+            401 => Err(PaperlessError::Unauthorized),
+            403 => Err(PaperlessError::Forbidden),
             404 => Err(PaperlessError::NotFound),
             status => {
                 let body = response.text().await.unwrap_or_default();

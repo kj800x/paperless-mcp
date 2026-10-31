@@ -1,13 +1,14 @@
 # paperless-mcp
 
-A read-only [MCP](https://modelcontextprotocol.io) server (Streamable HTTP) that lets agents
-search and read documents in a [Paperless-ngx](https://docs.paperless-ngx.com) instance.
+An [MCP](https://modelcontextprotocol.io) server (Streamable HTTP) that lets agents search, read
+and organize documents in a [Paperless-ngx](https://docs.paperless-ngx.com) instance. Agents can
+edit metadata and add notes, but cannot delete, upload, or create tags/correspondents/types.
 
 ## Authentication
 
 The server holds no credentials. Each client sends its own Paperless API token, which is
 forwarded to Paperless on every request, so Paperless's own permissions decide what the agent
-can see. `Authorization: Token <token>` and `Authorization: Bearer <token>` are both accepted.
+can see and change. `Authorization: Token <token>` and `Authorization: Bearer <token>` are both accepted.
 
 ## Installing on a machine (Claude Code)
 
@@ -24,6 +25,12 @@ claude mcp add --scope user --transport http paperless https://paperless-mcp.hom
 | `get_document` | Metadata, notes and OCR text (chunked via `offset` / `max_chars`) |
 | `find_similar_documents` | Documents similar to a given one |
 | `list_tags`, `list_correspondents`, `list_document_types` | Discover filter values |
+| `update_document` | Set title, date, correspondent, document type; add/remove tags (existing values only) |
+| `add_note` | Add a note to a document |
+
+Read tools are annotated `readOnlyHint: true`; the two write tools are annotated as
+non-destructive writes. To keep an agent read-only, give it a token for a Paperless user
+without change permissions (writes then fail with a 403 message).
 
 Filters take names (case-insensitive) or ids. Tag/correspondent/type lookups are cached per
 token for 5 minutes.

@@ -2,7 +2,8 @@
 
 An [MCP](https://modelcontextprotocol.io) server (Streamable HTTP) that lets agents search, read
 and organize documents in a [Paperless-ngx](https://docs.paperless-ngx.com) instance. Agents can
-edit metadata and add notes, but cannot delete, upload, or create tags/correspondents/types.
+edit metadata, add notes, and create tags and correspondents, but cannot delete, upload, or
+create document types.
 
 ## Authentication
 
@@ -27,8 +28,9 @@ claude mcp add --scope user --transport http paperless https://paperless-mcp.hom
 | `list_tags`, `list_correspondents`, `list_document_types` | Discover filter values |
 | `update_document` | Set title, date, correspondent, document type; add/remove tags (existing values only) |
 | `add_note` | Add a note to a document |
+| `create_tag`, `create_correspondent` | Create a new tag (optional color / inbox flag) or correspondent; returns the existing one if the name is taken |
 
-Read tools are annotated `readOnlyHint: true`; the two write tools are annotated as
+Read tools are annotated `readOnlyHint: true`; the write tools are annotated as
 non-destructive writes. To keep an agent read-only, give it a token for a Paperless user
 without change permissions (writes then fail with a 403 message).
 

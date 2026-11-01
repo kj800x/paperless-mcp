@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 const API_ACCEPT: &str = "application/json; version=9";
 const LOOKUP_TTL: Duration = Duration::from_secs(300);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_DOWNLOAD_BYTES: u64 = 100_000_000;
 
 #[derive(Debug)]
 pub enum PaperlessError {
@@ -198,6 +200,73 @@ impl Paperless {
     pub async fn document(&self, auth: &str, id: i64) -> Result<Value, PaperlessError> {
         self.get(auth, &format!("/api/documents/{}/", id), &[])
             .await
+    }
+
+    /// Downloads a document's file: the archived (OCR'd PDF) version by default, which
+    /// Paperless falls back to the original for when there is no archive.
+    /// Returns the content type and bytes.
+    pub async fn download(
+        &self,
+        auth: &str,
+        id: i64,
+        original: bool,
+    ) -> Result<(String, Vec<u8>), PaperlessError> {
+        let url = format!("{}/api/documents/{}/download/", self.base_url, id);
+        let mut request = self.http.get(&url).timeout(DOWNLOAD_TIMEOUT);
+        if original {
+            request = request.query(&[("original", "true")]);
+        }
+        let response = request
+            .header("Authorization", auth)
+            .header("Accept", API_ACCEPT)
+            .send()
+            .await
+            .map_err(|e| PaperlessError::Other(format!("Request to Paperless failed: {}", e)))?;
+
+        match response.status().as_u16() {
+            200..=299 => {}
+            401 => return Err(PaperlessError::Unauthorized),
+            403 => return Err(PaperlessError::Forbidden),
+            404 => return Err(PaperlessError::NotFound),
+            status => {
+                return Err(PaperlessError::Other(format!(
+                    "Paperless returned HTTP {} for the document file",
+                    status
+                )));
+            }
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_DOWNLOAD_BYTES)
+        {
+            return Err(PaperlessError::Other(format!(
+                "Document file is larger than {} MB",
+                MAX_DOWNLOAD_BYTES / 1_000_000
+            )));
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                v.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| PaperlessError::Other(format!("Downloading the file failed: {}", e)))?;
+        if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+            return Err(PaperlessError::Other(format!(
+                "Document file is larger than {} MB",
+                MAX_DOWNLOAD_BYTES / 1_000_000
+            )));
+        }
+        Ok((content_type, bytes.to_vec()))
     }
 
     pub async fn lookups(&self, auth: &str) -> Result<Arc<Lookups>, PaperlessError> {

@@ -24,6 +24,7 @@ claude mcp add --scope user --transport http paperless https://paperless-mcp.hom
 |---|---|
 | `search_documents` | Full-text query plus tag / correspondent / type / date filters, paginated |
 | `get_document` | Metadata, notes and OCR text (chunked via `offset` / `max_chars`) |
+| `get_document_pages` | Scanned pages as JPEG images, for what OCR misses (up to 5 pages per call, 50–300 dpi, archived PDF or original) |
 | `find_similar_documents` | Documents similar to a given one |
 | `list_tags`, `list_correspondents`, `list_document_types` | Discover filter values |
 | `update_document` | Set title, date, correspondent, document type; add/remove tags (existing values only) |

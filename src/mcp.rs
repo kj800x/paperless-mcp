@@ -24,8 +24,8 @@ fn error(id: Option<Value>, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-pub fn tool_text(text: String, is_error: bool) -> Value {
-    let mut result = json!({ "content": [{ "type": "text", "text": text }] });
+pub fn tool_result(content: Vec<Value>, is_error: bool) -> Value {
+    let mut result = json!({ "content": content });
     if is_error {
         result["isError"] = json!(true);
     }
@@ -112,10 +112,10 @@ pub async fn handle_mcp(
                     let result = tools::dispatch(name, &arguments, &auth, &paperless).await;
                     metrics.record_tool_call(name, result.is_ok());
                     let result = match result {
-                        Ok(text) => tool_text(text, false),
+                        Ok(content) => tool_result(content, false),
                         Err(text) => {
                             log::warn!("Tool {} failed: {}", name, text);
-                            tool_text(text, true)
+                            tool_result(vec![tools::text_block(text)], true)
                         }
                     };
                     success(request.id, result)

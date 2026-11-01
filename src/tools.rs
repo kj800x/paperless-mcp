@@ -5,7 +5,9 @@ use crate::paperless::{NamedObject, Page, Paperless, PaperlessError, truncate};
 pub const SERVER_INSTRUCTIONS: &str = "Access to a Paperless-ngx document archive \
 (scanned mail, receipts, statements, tax forms, manuals, etc.). Start with search_documents; \
 use list_tags / list_correspondents / list_document_types to discover filter values. \
-get_document returns OCR text, which may be imperfect. update_document changes a document's \
+get_document returns OCR text, which may be imperfect; when it is garbled or something \
+(handwriting, faded ink, layout) matters, get_document_pages returns the scanned pages as \
+images. update_document changes a document's \
 title, date, correspondent, type and tags (existing values only); create_tag / \
 create_correspondent add new ones first if needed; add_note attaches a note. \
 Nothing can be deleted or uploaded.";
@@ -14,10 +16,18 @@ const DEFAULT_PAGE_SIZE: i64 = 10;
 const MAX_PAGE_SIZE: i64 = 50;
 const DEFAULT_MAX_CHARS: usize = 20_000;
 const MAX_MAX_CHARS: usize = 100_000;
+const MAX_PAGES_PER_CALL: i64 = 5;
+const DEFAULT_PAGES_PER_CALL: i64 = 3;
+const DEFAULT_DPI: i64 = 150;
+const MIN_DPI: i64 = 50;
+const MAX_DPI: i64 = 300;
+/// Image types MCP clients (and Claude) accept as image content.
+const PASSTHROUGH_IMAGE_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
 
 const TOOL_NAMES: &[&str] = &[
     "search_documents",
     "get_document",
+    "get_document_pages",
     "find_similar_documents",
     "list_tags",
     "list_correspondents",
@@ -187,6 +197,37 @@ fn read_tool_definitions() -> Value {
             }
         },
         {
+            "name": "get_document_pages",
+            "description": format!("Get a document's scanned pages as images, for reading what \
+                OCR missed (handwriting, faded or skewed text, stamps, layout). Renders the \
+                archived PDF by default. Returns at most {} pages per call; use `first_page` to \
+                continue. If the stored file is an image it is returned as-is.", MAX_PAGES_PER_CALL),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer" },
+                    "first_page": { "type": "integer", "minimum": 1, "description": "1-based. Default 1" },
+                    "page_count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_PAGES_PER_CALL,
+                        "description": format!("Pages to return. Default {}", DEFAULT_PAGES_PER_CALL)
+                    },
+                    "dpi": {
+                        "type": "integer",
+                        "minimum": MIN_DPI,
+                        "maximum": MAX_DPI,
+                        "description": format!("Render resolution. Default {}; raise it for small or faint text", DEFAULT_DPI)
+                    },
+                    "original": {
+                        "type": "boolean",
+                        "description": "Use the originally uploaded file instead of the archived PDF. Default false"
+                    }
+                },
+                "required": ["id"]
+            }
+        },
+        {
             "name": "find_similar_documents",
             "description": "Find documents with content similar to the given document.",
             "inputSchema": {
@@ -226,8 +267,42 @@ pub async fn dispatch(
     args: &Value,
     auth: &str,
     paperless: &Paperless,
-) -> Result<String, String> {
+) -> Result<Vec<Value>, String> {
     let result = match name {
+        "get_document_pages" => get_document_pages(args, auth, paperless).await,
+        _ => dispatch_text(name, args, auth, paperless)
+            .await
+            .map(|text| vec![text_block(text)]),
+    };
+    result.map_err(|e| match e {
+        ToolError::Paperless(PaperlessError::NotFound) => {
+            "Not found (or not visible to this Paperless user)".to_string()
+        }
+        ToolError::Paperless(e) => e.to_string(),
+        ToolError::Invalid(msg) => msg,
+    })
+}
+
+pub fn text_block(text: String) -> Value {
+    json!({ "type": "text", "text": text })
+}
+
+fn image_block(data: &[u8], mime_type: &str) -> Value {
+    use base64::Engine;
+    json!({
+        "type": "image",
+        "data": base64::engine::general_purpose::STANDARD.encode(data),
+        "mimeType": mime_type,
+    })
+}
+
+async fn dispatch_text(
+    name: &str,
+    args: &Value,
+    auth: &str,
+    paperless: &Paperless,
+) -> Result<String, ToolError> {
+    match name {
         "search_documents" => search_documents(args, auth, paperless).await,
         "get_document" => get_document(args, auth, paperless).await,
         "find_similar_documents" => find_similar(args, auth, paperless).await,
@@ -242,15 +317,8 @@ pub async fn dispatch(
         "add_note" => add_note(args, auth, paperless).await,
         "create_tag" => create_tag(args, auth, paperless).await,
         "create_correspondent" => create_correspondent(args, auth, paperless).await,
-        _ => return Err(format!("Unknown tool: {}", name)),
-    };
-    result.map_err(|e| match e {
-        ToolError::Paperless(PaperlessError::NotFound) => {
-            "Not found (or not visible to this Paperless user)".to_string()
-        }
-        ToolError::Paperless(e) => e.to_string(),
-        ToolError::Invalid(msg) => msg,
-    })
+        _ => Err(ToolError::Invalid(format!("Unknown tool: {}", name))),
+    }
 }
 
 #[derive(Debug)]
@@ -791,6 +859,103 @@ async fn add_note(args: &Value, auth: &str, paperless: &Paperless) -> Result<Str
         id,
         paperless.document_url(id)
     ))
+}
+
+async fn get_document_pages(
+    args: &Value,
+    auth: &str,
+    paperless: &Paperless,
+) -> Result<Vec<Value>, ToolError> {
+    let id = arg_int(args, "id")?.ok_or_else(|| ToolError::Invalid("`id` is required".into()))?;
+    let first = arg_int(args, "first_page")?.unwrap_or(1);
+    if first < 1 {
+        return Err(ToolError::Invalid("`first_page` must be at least 1".into()));
+    }
+    let count = arg_int(args, "page_count")?
+        .unwrap_or(DEFAULT_PAGES_PER_CALL)
+        .clamp(1, MAX_PAGES_PER_CALL);
+    let dpi = arg_int(args, "dpi")?
+        .unwrap_or(DEFAULT_DPI)
+        .clamp(MIN_DPI, MAX_DPI);
+    let original = arg_bool(args, "original")?.unwrap_or(false);
+
+    let (lookups, doc, (content_type, file)) = tokio::try_join!(
+        paperless.lookups(auth),
+        paperless.document(auth, id),
+        paperless.download(auth, id, original),
+    )?;
+    let header = summary_line(&doc, &lookups);
+
+    if PASSTHROUGH_IMAGE_TYPES.contains(&content_type.as_str()) {
+        return Ok(vec![
+            text_block(format!(
+                "{}\nStored file is an image ({}); returned as-is.",
+                header, content_type
+            )),
+            image_block(&file, &content_type),
+        ]);
+    }
+    if content_type != "application/pdf" {
+        let hint = if original {
+            " Try again without `original` to get the archived PDF."
+        } else {
+            ""
+        };
+        return Err(ToolError::Invalid(format!(
+            "Can't render a {} file as page images.{}",
+            if content_type.is_empty() {
+                "untyped"
+            } else {
+                &content_type
+            },
+            hint
+        )));
+    }
+
+    let total = doc.get("page_count").and_then(|v| v.as_i64());
+    if let Some(total) = total
+        && first > total
+    {
+        return Err(ToolError::Invalid(format!(
+            "`first_page` {} is past the end; the document has {} page{}",
+            first,
+            total,
+            if total == 1 { "" } else { "s" }
+        )));
+    }
+    let mut last = first + count - 1;
+    if let Some(total) = total {
+        last = last.min(total);
+    }
+
+    let pages = crate::render::render_pdf_pages(&file, first as u32, last as u32, dpi as u32)
+        .await
+        .map_err(ToolError::Invalid)?;
+    if pages.is_empty() {
+        return Err(ToolError::Invalid(format!(
+            "No pages rendered from page {}",
+            first
+        )));
+    }
+    let last = first + pages.len() as i64 - 1;
+
+    let range = if first == last {
+        format!("page {}", first)
+    } else {
+        format!("pages {}–{}", first, last)
+    };
+    let of_total = total.map(|t| format!(" of {}", t)).unwrap_or_default();
+    let mut text = format!("{}\n{}{} at {} dpi.", header, range, of_total, dpi);
+    if total.is_some_and(|t| last < t) {
+        text.push_str(&format!(
+            " Call again with first_page={} for more.",
+            last + 1
+        ));
+    }
+
+    let mut content = vec![text_block(text)];
+    content.extend(pages.iter().map(|jpeg| image_block(jpeg, "image/jpeg")));
+    Ok(content)
 }
 
 fn arg_color(args: &Value, key: &str) -> Result<Option<String>, ToolError> {

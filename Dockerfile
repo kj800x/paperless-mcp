@@ -17,6 +17,8 @@ RUN touch src/main.rs && cargo build --release
 
 # ---- Runtime Stage ----
 FROM alpine:latest AS runtime
+# pdftoppm renders document pages for get_document_pages
+RUN apk add --no-cache poppler-utils
 COPY --from=builder /usr/src/paperless-mcp/target/release/paperless-mcp /usr/local/bin/paperless-mcp
 USER 1000
 CMD ["paperless-mcp"]

@@ -1,6 +1,7 @@
 mod mcp;
 mod metrics;
 mod paperless;
+mod render;
 mod tools;
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, web};
